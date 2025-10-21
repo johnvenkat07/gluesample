@@ -1,0 +1,6 @@
+# AWS Infrastructure Project - Simplified Requirements
+# Core AWS libraries
+boto3>=1.28.0
+
+# Testing (optional)
+pytest>=7.0.0

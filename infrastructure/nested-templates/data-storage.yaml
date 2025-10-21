@@ -1,0 +1,193 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Reusable Data Storage Components (S3, RDS, Secrets Manager) for AWS Glue ETL Pipeline'
+
+Parameters:
+  EnvironmentName:
+    Type: String
+    Description: Environment name for resource naming
+  
+  DatabasePassword:
+    Type: String
+    NoEcho: true
+    Description: Master password for PostgreSQL database
+  
+  PrivateSubnet1Id:
+    Type: String
+    Description: Private Subnet 1 ID
+  
+  PrivateSubnet2Id:
+    Type: String
+    Description: Private Subnet 2 ID
+  
+  DatabaseSecurityGroupId:
+    Type: String
+    Description: Database Security Group ID
+  
+  RDSEnhancedMonitoringRoleArn:
+    Type: String
+    Description: RDS Enhanced Monitoring Role ARN
+  
+  NotificationEmail:
+    Type: String
+    Description: Email address for notifications
+
+Resources:
+  # ====================================================
+  # S3 BUCKET FOR ETL PIPELINE
+  # ====================================================
+  S3Bucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub ${EnvironmentName}-glue-etl-pipeline-${AWS::AccountId}
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: ArchiveOldFiles
+            Status: Enabled
+            ExpirationInDays: 2555  # 7 years
+            NoncurrentVersionExpirationInDays: 365
+          - Id: DeleteTempFiles
+            Status: Enabled
+            Prefix: temp/
+            ExpirationInDays: 7
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-glue-etl-bucket
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  # ====================================================
+  # RDS DATABASE SUBNET GROUP
+  # ====================================================
+  DatabaseSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: Subnet group for RDS database
+      SubnetIds:
+        - !Ref PrivateSubnet1Id
+        - !Ref PrivateSubnet2Id
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-db-subnet-group
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  # ====================================================
+  # RDS POSTGRESQL DATABASE
+  # ====================================================
+  DatabaseInstance:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      DBInstanceIdentifier: !Sub ${EnvironmentName}-glue-etl-db
+      DBInstanceClass: db.t3.micro
+      Engine: postgres
+      EngineVersion: '15.4'
+      MasterUsername: etl_admin
+      MasterUserPassword: !Ref DatabasePassword
+      AllocatedStorage: 20
+      MaxAllocatedStorage: 100
+      StorageType: gp2
+      StorageEncrypted: true
+      VPCSecurityGroups:
+        - !Ref DatabaseSecurityGroupId
+      DBSubnetGroupName: !Ref DatabaseSubnetGroup
+      BackupRetentionPeriod: 7
+      PreferredBackupWindow: "03:00-04:00"
+      PreferredMaintenanceWindow: "Sun:04:00-Sun:05:00"
+      DeletionProtection: false
+      EnablePerformanceInsights: true
+      MonitoringInterval: 60
+      MonitoringRoleArn: !Ref RDSEnhancedMonitoringRoleArn
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-glue-etl-database
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  # ====================================================
+  # SECRETS MANAGER FOR DATABASE CREDENTIALS
+  # ====================================================
+  DatabaseSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub ${EnvironmentName}/glue-etl/database
+      Description: Database credentials for Glue ETL pipeline
+      SecretString: !Sub |
+        {
+          "username": "etl_admin",
+          "password": "${DatabasePassword}",
+          "host": "${DatabaseInstance.Endpoint.Address}",
+          "port": ${DatabaseInstance.Endpoint.Port},
+          "dbname": "postgres"
+        }
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-database-secret
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  # ====================================================
+  # SNS TOPIC FOR NOTIFICATIONS
+  # ====================================================
+  SNSTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub ${EnvironmentName}-glue-etl-notifications
+      DisplayName: Glue ETL Pipeline Notifications
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  SNSSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Protocol: email
+      TopicArn: !Ref SNSTopic
+      Endpoint: !Ref NotificationEmail
+
+Outputs:
+  S3BucketName:
+    Description: S3 Bucket Name
+    Value: !Ref S3Bucket
+    Export:
+      Name: !Sub ${EnvironmentName}-S3-Bucket-Name
+
+  S3BucketArn:
+    Description: S3 Bucket ARN
+    Value: !GetAtt S3Bucket.Arn
+    Export:
+      Name: !Sub ${EnvironmentName}-S3-Bucket-Arn
+
+  DatabaseEndpoint:
+    Description: RDS Database Endpoint
+    Value: !GetAtt DatabaseInstance.Endpoint.Address
+    Export:
+      Name: !Sub ${EnvironmentName}-Database-Endpoint
+
+  DatabasePort:
+    Description: RDS Database Port
+    Value: !GetAtt DatabaseInstance.Endpoint.Port
+    Export:
+      Name: !Sub ${EnvironmentName}-Database-Port
+
+  DatabaseSecretArn:
+    Description: Database Secret ARN
+    Value: !Ref DatabaseSecret
+    Export:
+      Name: !Sub ${EnvironmentName}-Database-Secret-Arn
+
+  SNSTopicArn:
+    Description: SNS Topic ARN
+    Value: !Ref SNSTopic
+    Export:
+      Name: !Sub ${EnvironmentName}-SNS-Topic-Arn

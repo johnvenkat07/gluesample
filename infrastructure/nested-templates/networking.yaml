@@ -1,0 +1,240 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Reusable VPC and Networking Components for AWS Glue ETL Pipeline'
+
+Parameters:
+  EnvironmentName:
+    Type: String
+    Description: Environment name for resource naming
+  
+  VpcCIDR:
+    Type: String
+    Default: 10.0.0.0/16
+    Description: CIDR block for VPC
+  
+  PrivateSubnet1CIDR:
+    Type: String
+    Default: 10.0.1.0/24
+    Description: CIDR block for Private Subnet 1
+  
+  PrivateSubnet2CIDR:
+    Type: String
+    Default: 10.0.2.0/24
+    Description: CIDR block for Private Subnet 2
+
+Resources:
+  # ====================================================
+  # VPC AND SUBNETS
+  # ====================================================
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCIDR
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-glue-etl-vpc
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [0, !GetAZs '']
+      CidrBlock: !Ref PrivateSubnet1CIDR
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-private-subnet-1
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [1, !GetAZs '']
+      CidrBlock: !Ref PrivateSubnet2CIDR
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-private-subnet-2
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  # ====================================================
+  # ROUTE TABLES
+  # ====================================================
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-private-routes
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  PrivateSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      SubnetId: !Ref PrivateSubnet1
+
+  PrivateSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      SubnetId: !Ref PrivateSubnet2
+
+  # ====================================================
+  # VPC ENDPOINTS
+  # ====================================================
+  S3VPCEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VPC
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.s3
+      VpcEndpointType: Gateway
+      RouteTableIds:
+        - !Ref PrivateRouteTable
+
+  SecretsManagerVPCEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VPC
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.secretsmanager
+      VpcEndpointType: Interface
+      SubnetIds:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+      SecurityGroupIds:
+        - !Ref VPCEndpointSecurityGroup
+
+  # ====================================================
+  # SECURITY GROUPS
+  # ====================================================
+  DatabaseSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub ${EnvironmentName}-database-sg
+      GroupDescription: Security group for RDS PostgreSQL database
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-database-sg
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  LambdaSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub ${EnvironmentName}-lambda-sg
+      GroupDescription: Security group for Lambda functions
+      VpcId: !Ref VPC
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-lambda-sg
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  GlueSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub ${EnvironmentName}-glue-sg
+      GroupDescription: Security group for Glue jobs
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: -1
+          SourceSecurityGroupId: !Ref GlueSecurityGroup
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-glue-sg
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  VPCEndpointSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub ${EnvironmentName}-vpc-endpoint-sg
+      GroupDescription: Security group for VPC endpoints
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          SourceSecurityGroupId: !Ref LambdaSecurityGroup
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          SourceSecurityGroupId: !Ref GlueSecurityGroup
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-vpc-endpoint-sg
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  # ====================================================
+  # SECURITY GROUP RULES (SEPARATE FOR CIRCULAR DEPS)
+  # ====================================================
+  DatabaseSecurityGroupIngressFromLambda:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref DatabaseSecurityGroup
+      IpProtocol: tcp
+      FromPort: 5432
+      ToPort: 5432
+      SourceSecurityGroupId: !Ref LambdaSecurityGroup
+
+  DatabaseSecurityGroupIngressFromGlue:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref DatabaseSecurityGroup
+      IpProtocol: tcp
+      FromPort: 5432
+      ToPort: 5432
+      SourceSecurityGroupId: !Ref GlueSecurityGroup
+
+Outputs:
+  VPCId:
+    Description: VPC ID
+    Value: !Ref VPC
+    Export:
+      Name: !Sub ${EnvironmentName}-VPC-ID
+
+  PrivateSubnet1Id:
+    Description: Private Subnet 1 ID
+    Value: !Ref PrivateSubnet1
+    Export:
+      Name: !Sub ${EnvironmentName}-PrivateSubnet1-ID
+
+  PrivateSubnet2Id:
+    Description: Private Subnet 2 ID
+    Value: !Ref PrivateSubnet2
+    Export:
+      Name: !Sub ${EnvironmentName}-PrivateSubnet2-ID
+
+  DatabaseSecurityGroupId:
+    Description: Database Security Group ID
+    Value: !Ref DatabaseSecurityGroup
+    Export:
+      Name: !Sub ${EnvironmentName}-DatabaseSG-ID
+
+  LambdaSecurityGroupId:
+    Description: Lambda Security Group ID
+    Value: !Ref LambdaSecurityGroup
+    Export:
+      Name: !Sub ${EnvironmentName}-LambdaSG-ID
+
+  GlueSecurityGroupId:
+    Description: Glue Security Group ID
+    Value: !Ref GlueSecurityGroup
+    Export:
+      Name: !Sub ${EnvironmentName}-GlueSG-ID

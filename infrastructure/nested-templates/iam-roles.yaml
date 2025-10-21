@@ -1,0 +1,209 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Reusable IAM Roles and Policies for AWS Glue ETL Pipeline'
+
+Parameters:
+  EnvironmentName:
+    Type: String
+    Description: Environment name for resource naming
+  
+  S3BucketArn:
+    Type: String
+    Description: ARN of the S3 bucket for ETL pipeline
+  
+  DatabaseSecretArn:
+    Type: String
+    Description: ARN of the database secret
+  
+  SNSTopicArn:
+    Type: String
+    Description: ARN of the SNS topic
+
+Resources:
+  # ====================================================
+  # LAMBDA EXECUTION ROLE
+  # ====================================================
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${EnvironmentName}-glue-etl-lambda-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+      Policies:
+        - PolicyName: GlueETLLambdaPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                  - s3:ListBucket
+                  - s3:HeadObject
+                Resource:
+                  - !Sub ${S3BucketArn}/*
+                  - !Ref S3BucketArn
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource: !Ref DatabaseSecretArn
+              - Effect: Allow
+                Action:
+                  - states:StartExecution
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref SNSTopicArn
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  # ====================================================
+  # GLUE SERVICE ROLE
+  # ====================================================
+  GlueServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${EnvironmentName}-glue-etl-service-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: glue.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole
+      Policies:
+        - PolicyName: GlueETLServicePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                  - s3:PutObject
+                  - s3:DeleteObject
+                  - s3:ListBucket
+                  - s3:HeadObject
+                Resource:
+                  - !Sub ${S3BucketArn}/*
+                  - !Ref S3BucketArn
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource: !Ref DatabaseSecretArn
+              - Effect: Allow
+                Action:
+                  - ec2:CreateNetworkInterface
+                  - ec2:DeleteNetworkInterface
+                  - ec2:DescribeNetworkInterfaces
+                  - ec2:DescribeSecurityGroups
+                  - ec2:DescribeSubnets
+                  - ec2:DescribeVpcAttribute
+                  - ec2:DescribeRouteTables
+                  - ec2:CreateTags
+                  - ec2:DeleteTags
+                  - ec2:DescribeVpcEndpoints
+                Resource: "*"
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  # ====================================================
+  # STEP FUNCTIONS EXECUTION ROLE
+  # ====================================================
+  StepFunctionsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${EnvironmentName}-glue-etl-stepfunctions-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: states.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: StepFunctionsExecutionPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - glue:StartJobRun
+                  - glue:GetJobRun
+                  - glue:BatchStopJobRun
+                  - glue:GetJob
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref SNSTopicArn
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:DescribeLogGroups
+                  - logs:DescribeLogStreams
+                Resource: "*"
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  # ====================================================
+  # RDS ENHANCED MONITORING ROLE
+  # ====================================================
+  RDSEnhancedMonitoringRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: monitoring.rds.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonRDSEnhancedMonitoringRole
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+Outputs:
+  LambdaExecutionRoleArn:
+    Description: Lambda Execution Role ARN
+    Value: !GetAtt LambdaExecutionRole.Arn
+    Export:
+      Name: !Sub ${EnvironmentName}-LambdaRole-Arn
+
+  GlueServiceRoleArn:
+    Description: Glue Service Role ARN
+    Value: !GetAtt GlueServiceRole.Arn
+    Export:
+      Name: !Sub ${EnvironmentName}-GlueRole-Arn
+
+  StepFunctionsRoleArn:
+    Description: Step Functions Execution Role ARN
+    Value: !GetAtt StepFunctionsRole.Arn
+    Export:
+      Name: !Sub ${EnvironmentName}-StepFunctionsRole-Arn
+
+  RDSEnhancedMonitoringRoleArn:
+    Description: RDS Enhanced Monitoring Role ARN
+    Value: !GetAtt RDSEnhancedMonitoringRole.Arn
+    Export:
+      Name: !Sub ${EnvironmentName}-RDSMonitoringRole-Arn

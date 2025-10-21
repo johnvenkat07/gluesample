@@ -1,0 +1,564 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'AWS Glue ETL Pipeline with Intelligent Concurrency Control - Unified Stack'
+
+Parameters:
+  EnvironmentName:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, test, prod]
+    Description: Environment name for resource naming
+  
+  DatabasePassword:
+    Type: String
+    NoEcho: true
+    MinLength: 8
+    Description: Master password for PostgreSQL database
+  
+  NotificationEmail:
+    Type: String
+    Description: Email address for ETL pipeline notifications
+    Default: admin@example.com
+  
+  VpcCIDR:
+    Type: String
+    Default: 10.0.0.0/16
+    Description: CIDR block for VPC
+  
+  PrivateSubnet1CIDR:
+    Type: String
+    Default: 10.0.1.0/24
+    Description: CIDR block for Private Subnet 1
+  
+  PrivateSubnet2CIDR:
+    Type: String
+    Default: 10.0.2.0/24
+    Description: CIDR block for Private Subnet 2
+  
+  TemplatesBucketName:
+    Type: String
+    Description: S3 bucket containing nested CloudFormation templates
+    Default: ''
+
+Conditions:
+  HasTemplatesBucket: !Not [!Equals [!Ref TemplatesBucketName, '']]
+
+Resources:
+  # ====================================================
+  # NESTED STACK: NETWORKING COMPONENTS
+  # ====================================================
+  NetworkingStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: !If 
+        - HasTemplatesBucket
+        - !Sub 'https://${TemplatesBucketName}.s3.${AWS::Region}.amazonaws.com/nested-templates/networking.yaml'
+        - !Sub 'https://s3.${AWS::Region}.amazonaws.com/${AWS::StackName}-templates/nested-templates/networking.yaml'
+      Parameters:
+        EnvironmentName: !Ref EnvironmentName
+        VpcCIDR: !Ref VpcCIDR
+        PrivateSubnet1CIDR: !Ref PrivateSubnet1CIDR
+        PrivateSubnet2CIDR: !Ref PrivateSubnet2CIDR
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Component
+          Value: Networking
+
+  # ====================================================
+  # NESTED STACK: DATA STORAGE COMPONENTS
+  # ====================================================
+  DataStorageStack:
+    Type: AWS::CloudFormation::Stack
+    DependsOn: NetworkingStack
+    Properties:
+      TemplateURL: !If 
+        - HasTemplatesBucket
+        - !Sub 'https://${TemplatesBucketName}.s3.${AWS::Region}.amazonaws.com/nested-templates/data-storage.yaml'
+        - !Sub 'https://s3.${AWS::Region}.amazonaws.com/${AWS::StackName}-templates/nested-templates/data-storage.yaml'
+      Parameters:
+        EnvironmentName: !Ref EnvironmentName
+        DatabasePassword: !Ref DatabasePassword
+        PrivateSubnet1Id: !GetAtt NetworkingStack.Outputs.PrivateSubnet1Id
+        PrivateSubnet2Id: !GetAtt NetworkingStack.Outputs.PrivateSubnet2Id
+        DatabaseSecurityGroupId: !GetAtt NetworkingStack.Outputs.DatabaseSecurityGroupId
+        RDSEnhancedMonitoringRoleArn: !GetAtt IAMRolesStack.Outputs.RDSEnhancedMonitoringRoleArn
+        NotificationEmail: !Ref NotificationEmail
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Component
+          Value: DataStorage
+
+  # ====================================================
+  # NESTED STACK: IAM ROLES
+  # ====================================================
+  IAMRolesStack:
+    Type: AWS::CloudFormation::Stack
+    DependsOn: DataStorageStack
+    Properties:
+      TemplateURL: !If 
+        - HasTemplatesBucket
+        - !Sub 'https://${TemplatesBucketName}.s3.${AWS::Region}.amazonaws.com/nested-templates/iam-roles.yaml'
+        - !Sub 'https://s3.${AWS::Region}.amazonaws.com/${AWS::StackName}-templates/nested-templates/iam-roles.yaml'
+      Parameters:
+        EnvironmentName: !Ref EnvironmentName
+        S3BucketArn: !GetAtt DataStorageStack.Outputs.S3BucketArn
+        DatabaseSecretArn: !GetAtt DataStorageStack.Outputs.DatabaseSecretArn
+        SNSTopicArn: !GetAtt DataStorageStack.Outputs.SNSTopicArn
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Component
+          Value: IAM
+
+  # ====================================================
+  # GLUE DATABASE
+  # ====================================================
+  GlueDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: !Sub ${EnvironmentName}_glue_etl_database
+        Description: Database for Glue ETL pipeline metadata
+
+  # ====================================================
+  # GLUE JOBS
+  # ====================================================
+  GlueRawIngestionJob:
+    Type: AWS::Glue::Job
+    DependsOn: IAMRolesStack
+    Properties:
+      Name: !Sub ${EnvironmentName}-raw-ingestion-job
+      Role: !GetAtt IAMRolesStack.Outputs.GlueServiceRoleArn
+      Description: Downloads Excel from S3 and ingests raw data into PostgreSQL
+      GlueVersion: '4.0'
+      Command:
+        Name: glueetl
+        ScriptLocation: !Sub 
+          - 's3://${BucketName}/glue-scripts/raw_ingestion_job.py'
+          - BucketName: !GetAtt DataStorageStack.Outputs.S3BucketName
+        PythonVersion: '3'
+      DefaultArguments:
+        '--job-bookmark-option': job-bookmark-disable
+        '--enable-metrics': ''
+        '--enable-continuous-cloudwatch-log': 'true'
+        '--enable-spark-ui': 'true'
+        '--spark-event-logs-path': !Sub 
+          - 's3://${BucketName}/spark-logs/'
+          - BucketName: !GetAtt DataStorageStack.Outputs.S3BucketName
+        '--additional-python-modules': 'psycopg2-binary,openpyxl,pandas'
+        '--TempDir': !Sub 
+          - 's3://${BucketName}/temp/'
+          - BucketName: !GetAtt DataStorageStack.Outputs.S3BucketName
+      Connections:
+        Connections: []
+      ExecutionProperty:
+        MaxConcurrentRuns: 10
+      MaxRetries: 2
+      Timeout: 2880  # 48 hours
+      WorkerType: G.1X
+      NumberOfWorkers: 10
+      Tags:
+        Environment: !Ref EnvironmentName
+        Purpose: RawDataIngestion
+
+  GlueTransformationJob:
+    Type: AWS::Glue::Job
+    DependsOn: IAMRolesStack
+    Properties:
+      Name: !Sub ${EnvironmentName}-transformation-job
+      Role: !GetAtt IAMRolesStack.Outputs.GlueServiceRoleArn
+      Description: Transforms raw data into business-specific actual tables
+      GlueVersion: '4.0'
+      Command:
+        Name: glueetl
+        ScriptLocation: !Sub 
+          - 's3://${BucketName}/glue-scripts/transformation_job.py'
+          - BucketName: !GetAtt DataStorageStack.Outputs.S3BucketName
+        PythonVersion: '3'
+      DefaultArguments:
+        '--job-bookmark-option': job-bookmark-disable
+        '--enable-metrics': ''
+        '--enable-continuous-cloudwatch-log': 'true'
+        '--enable-spark-ui': 'true'
+        '--spark-event-logs-path': !Sub 
+          - 's3://${BucketName}/spark-logs/'
+          - BucketName: !GetAtt DataStorageStack.Outputs.S3BucketName
+        '--additional-python-modules': 'psycopg2-binary,pandas'
+        '--TempDir': !Sub 
+          - 's3://${BucketName}/temp/'
+          - BucketName: !GetAtt DataStorageStack.Outputs.S3BucketName
+      ExecutionProperty:
+        MaxConcurrentRuns: 10
+      MaxRetries: 2
+      Timeout: 2880
+      WorkerType: G.1X
+      NumberOfWorkers: 10
+      Tags:
+        Environment: !Ref EnvironmentName
+        Purpose: DataTransformation
+
+  GlueCSVExportJob:
+    Type: AWS::Glue::Job
+    DependsOn: IAMRolesStack
+    Properties:
+      Name: !Sub ${EnvironmentName}-csv-export-job
+      Role: !GetAtt IAMRolesStack.Outputs.GlueServiceRoleArn
+      Description: Exports transformed data to CSV files in S3
+      GlueVersion: '4.0'
+      Command:
+        Name: glueetl
+        ScriptLocation: !Sub 
+          - 's3://${BucketName}/glue-scripts/csv_export_job.py'
+          - BucketName: !GetAtt DataStorageStack.Outputs.S3BucketName
+        PythonVersion: '3'
+      DefaultArguments:
+        '--job-bookmark-option': job-bookmark-disable
+        '--enable-metrics': ''
+        '--enable-continuous-cloudwatch-log': 'true'
+        '--enable-spark-ui': 'true'
+        '--spark-event-logs-path': !Sub 
+          - 's3://${BucketName}/spark-logs/'
+          - BucketName: !GetAtt DataStorageStack.Outputs.S3BucketName
+        '--additional-python-modules': 'psycopg2-binary,pandas'
+        '--TempDir': !Sub 
+          - 's3://${BucketName}/temp/'
+          - BucketName: !GetAtt DataStorageStack.Outputs.S3BucketName
+      ExecutionProperty:
+        MaxConcurrentRuns: 10
+      MaxRetries: 2
+      Timeout: 1440
+      WorkerType: G.1X
+      NumberOfWorkers: 10
+      Tags:
+        Environment: !Ref EnvironmentName
+        Purpose: CSVExport
+
+  GlueFileArchiverJob:
+    Type: AWS::Glue::Job
+    DependsOn: IAMRolesStack
+    Properties:
+      Name: !Sub ${EnvironmentName}-file-archiver-job
+      Role: !GetAtt IAMRolesStack.Outputs.GlueServiceRoleArn
+      Description: Archives processed files and cleans up temporary data
+      GlueVersion: '4.0'
+      Command:
+        Name: glueetl
+        ScriptLocation: !Sub 
+          - 's3://${BucketName}/glue-scripts/file_archiver_job.py'
+          - BucketName: !GetAtt DataStorageStack.Outputs.S3BucketName
+        PythonVersion: '3'
+      DefaultArguments:
+        '--job-bookmark-option': job-bookmark-disable
+        '--enable-metrics': ''
+        '--enable-continuous-cloudwatch-log': 'true'
+        '--enable-spark-ui': 'true'
+        '--spark-event-logs-path': !Sub 
+          - 's3://${BucketName}/spark-logs/'
+          - BucketName: !GetAtt DataStorageStack.Outputs.S3BucketName
+        '--additional-python-modules': 'psycopg2-binary'
+        '--TempDir': !Sub 
+          - 's3://${BucketName}/temp/'
+          - BucketName: !GetAtt DataStorageStack.Outputs.S3BucketName
+      ExecutionProperty:
+        MaxConcurrentRuns: 5
+      MaxRetries: 2
+      Timeout: 720
+      WorkerType: G.1X
+      NumberOfWorkers: 5
+      Tags:
+        Environment: !Ref EnvironmentName
+        Purpose: FileArchival
+
+  # ====================================================
+  # LAMBDA FUNCTIONS
+  # ====================================================
+  S3TriggerLambda:
+    Type: AWS::Lambda::Function
+    DependsOn: [IAMRolesStack, StepFunctionsStateMachine]
+    Properties:
+      FunctionName: !Sub ${EnvironmentName}-glue-etl-s3-trigger
+      Runtime: python3.9
+      Handler: s3_trigger.lambda_handler
+      Role: !GetAtt IAMRolesStack.Outputs.LambdaExecutionRoleArn
+      Code:
+        ZipFile: |
+          # Placeholder - will be replaced with actual code during deployment
+          def lambda_handler(event, context):
+              return {'statusCode': 200, 'body': 'Placeholder function'}
+      Timeout: 900
+      MemorySize: 512
+      Environment:
+        Variables:
+          DB_SECRET_NAME: !GetAtt DataStorageStack.Outputs.DatabaseSecretArn
+          STEP_FUNCTIONS_ARN: !Ref StepFunctionsStateMachine
+      VpcConfig:
+        SecurityGroupIds:
+          - !GetAtt NetworkingStack.Outputs.LambdaSecurityGroupId
+        SubnetIds:
+          - !GetAtt NetworkingStack.Outputs.PrivateSubnet1Id
+          - !GetAtt NetworkingStack.Outputs.PrivateSubnet2Id
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  ReleaseLockLambda:
+    Type: AWS::Lambda::Function
+    DependsOn: IAMRolesStack
+    Properties:
+      FunctionName: !Sub ${EnvironmentName}-glue-etl-release-lock
+      Runtime: python3.9
+      Handler: release_lock.lambda_handler
+      Role: !GetAtt IAMRolesStack.Outputs.LambdaExecutionRoleArn
+      Code:
+        ZipFile: |
+          # Placeholder - will be replaced with actual code during deployment
+          def lambda_handler(event, context):
+              return {'statusCode': 200, 'body': 'Placeholder function'}
+      Timeout: 300
+      MemorySize: 256
+      Environment:
+        Variables:
+          DB_SECRET_NAME: !GetAtt DataStorageStack.Outputs.DatabaseSecretArn
+      VpcConfig:
+        SecurityGroupIds:
+          - !GetAtt NetworkingStack.Outputs.LambdaSecurityGroupId
+        SubnetIds:
+          - !GetAtt NetworkingStack.Outputs.PrivateSubnet1Id
+          - !GetAtt NetworkingStack.Outputs.PrivateSubnet2Id
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  # ====================================================
+  # STEP FUNCTIONS STATE MACHINE
+  # ====================================================
+  StepFunctionsStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    DependsOn: [IAMRolesStack, GlueRawIngestionJob, GlueTransformationJob, GlueCSVExportJob, GlueFileArchiverJob]
+    Properties:
+      StateMachineName: !Sub ${EnvironmentName}-glue-etl-pipeline
+      RoleArn: !GetAtt IAMRolesStack.Outputs.StepFunctionsRoleArn
+      DefinitionString: !Sub |
+        {
+          "Comment": "AWS Glue ETL Pipeline with Intelligent Concurrency Control",
+          "StartAt": "RawIngestion",
+          "States": {
+            "RawIngestion": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::glue:startJobRun.sync",
+              "Parameters": {
+                "JobName": "${GlueRawIngestionJob}",
+                "Arguments": {
+                  "--batch_id.$": "$.batch_id",
+                  "--school_id.$": "$.school_id",
+                  "--bucket_name.$": "$.bucket_name",
+                  "--object_key.$": "$.object_key",
+                  "--db_secret_name": "${DataStorageStack.Outputs.DatabaseSecretArn}"
+                }
+              },
+              "Next": "DataTransformation",
+              "Catch": [{"ErrorEquals": ["States.ALL"], "Next": "HandleFailure", "ResultPath": "$.error"}],
+              "Retry": [{"ErrorEquals": ["Glue.AWSGlueException"], "IntervalSeconds": 30, "MaxAttempts": 2, "BackoffRate": 2}]
+            },
+            "DataTransformation": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::glue:startJobRun.sync",
+              "Parameters": {
+                "JobName": "${GlueTransformationJob}",
+                "Arguments": {
+                  "--batch_id.$": "$.batch_id",
+                  "--school_id.$": "$.school_id",
+                  "--db_secret_name": "${DataStorageStack.Outputs.DatabaseSecretArn}"
+                }
+              },
+              "Next": "CSVExport",
+              "Catch": [{"ErrorEquals": ["States.ALL"], "Next": "HandleFailure", "ResultPath": "$.error"}],
+              "Retry": [{"ErrorEquals": ["Glue.AWSGlueException"], "IntervalSeconds": 30, "MaxAttempts": 2, "BackoffRate": 2}]
+            },
+            "CSVExport": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::glue:startJobRun.sync",
+              "Parameters": {
+                "JobName": "${GlueCSVExportJob}",
+                "Arguments": {
+                  "--batch_id.$": "$.batch_id",
+                  "--school_id.$": "$.school_id",
+                  "--db_secret_name": "${DataStorageStack.Outputs.DatabaseSecretArn}",
+                  "--output_bucket": "${DataStorageStack.Outputs.S3BucketName}"
+                }
+              },
+              "Next": "FileArchival",
+              "Catch": [{"ErrorEquals": ["States.ALL"], "Next": "HandleFailure", "ResultPath": "$.error"}],
+              "Retry": [{"ErrorEquals": ["Glue.AWSGlueException"], "IntervalSeconds": 30, "MaxAttempts": 2, "BackoffRate": 2}]
+            },
+            "FileArchival": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::glue:startJobRun.sync",
+              "Parameters": {
+                "JobName": "${GlueFileArchiverJob}",
+                "Arguments": {
+                  "--batch_id.$": "$.batch_id",
+                  "--school_id.$": "$.school_id",
+                  "--bucket_name.$": "$.bucket_name",
+                  "--object_key.$": "$.object_key",
+                  "--db_secret_name": "${DataStorageStack.Outputs.DatabaseSecretArn}"
+                }
+              },
+              "Next": "ReleaseLock",
+              "Catch": [{"ErrorEquals": ["States.ALL"], "Next": "HandleFailure", "ResultPath": "$.error"}],
+              "Retry": [{"ErrorEquals": ["Glue.AWSGlueException"], "IntervalSeconds": 30, "MaxAttempts": 2, "BackoffRate": 2}]
+            },
+            "ReleaseLock": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "${ReleaseLockLambda}",
+                "Payload": {
+                  "batch_id.$": "$.batch_id",
+                  "school_id.$": "$.school_id",
+                  "status": "SUCCESS"
+                }
+              },
+              "Next": "ProcessingCompleted"
+            },
+            "ProcessingCompleted": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::sns:publish",
+              "Parameters": {
+                "TopicArn": "${DataStorageStack.Outputs.SNSTopicArn}",
+                "Subject.$": "States.Format('ETL Processing Completed - School {}', $.school_id)",
+                "Message.$": "States.Format('ETL processing completed successfully for school {} batch {}.', $.school_id, $.batch_id)"
+              },
+              "End": true
+            },
+            "HandleFailure": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "${ReleaseLockLambda}",
+                "Payload": {
+                  "batch_id.$": "$.batch_id",
+                  "school_id.$": "$.school_id",
+                  "status": "FAILED",
+                  "error_message.$": "$.error.Cause"
+                }
+              },
+              "Next": "NotifyFailure"
+            },
+            "NotifyFailure": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::sns:publish",
+              "Parameters": {
+                "TopicArn": "${DataStorageStack.Outputs.SNSTopicArn}",
+                "Subject.$": "States.Format('ETL Processing Failed - School {}', $.school_id)",
+                "Message.$": "States.Format('ETL processing failed for school {} batch {}. Error: {}', $.school_id, $.batch_id, $.error.Cause)"
+              },
+              "Next": "ProcessingFailed"
+            },
+            "ProcessingFailed": {
+              "Type": "Fail",
+              "Cause": "ETL Pipeline execution failed"
+            }
+          }
+        }
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  # ====================================================
+  # S3 BUCKET NOTIFICATION CONFIGURATION
+  # ====================================================
+  S3BucketNotificationPermission:
+    Type: AWS::Lambda::Permission
+    DependsOn: [DataStorageStack, S3TriggerLambda]
+    Properties:
+      FunctionName: !Ref S3TriggerLambda
+      Action: lambda:InvokeFunction
+      Principal: s3.amazonaws.com
+      SourceArn: !GetAtt DataStorageStack.Outputs.S3BucketArn
+
+  S3BucketNotificationConfiguration:
+    Type: AWS::S3::Bucket
+    DependsOn: [S3BucketNotificationPermission]
+    Properties:
+      BucketName: !GetAtt DataStorageStack.Outputs.S3BucketName
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: s3:ObjectCreated:*
+            Function: !GetAtt S3TriggerLambda.Arn
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: incoming/
+                  - Name: suffix
+                    Value: .xlsx
+
+Outputs:
+  # ====================================================
+  # CORE INFRASTRUCTURE OUTPUTS
+  # ====================================================
+  VPCId:
+    Description: VPC ID
+    Value: !GetAtt NetworkingStack.Outputs.VPCId
+    Export:
+      Name: !Sub ${EnvironmentName}-VPC-ID
+
+  S3BucketName:
+    Description: S3 Bucket for ETL pipeline
+    Value: !GetAtt DataStorageStack.Outputs.S3BucketName
+    Export:
+      Name: !Sub ${EnvironmentName}-S3-Bucket
+
+  DatabaseEndpoint:
+    Description: RDS Database endpoint
+    Value: !GetAtt DataStorageStack.Outputs.DatabaseEndpoint
+    Export:
+      Name: !Sub ${EnvironmentName}-Database-Endpoint
+
+  DatabaseSecretArn:
+    Description: Database secret ARN
+    Value: !GetAtt DataStorageStack.Outputs.DatabaseSecretArn
+    Export:
+      Name: !Sub ${EnvironmentName}-Database-Secret
+
+  StepFunctionsStateMachineArn:
+    Description: Step Functions State Machine ARN
+    Value: !Ref StepFunctionsStateMachine
+    Export:
+      Name: !Sub ${EnvironmentName}-StepFunctions-ARN
+
+  SNSTopicArn:
+    Description: SNS Topic ARN for notifications
+    Value: !GetAtt DataStorageStack.Outputs.SNSTopicArn
+    Export:
+      Name: !Sub ${EnvironmentName}-SNS-Topic
+
+  # ====================================================
+  # GLUE JOB OUTPUTS
+  # ====================================================
+  GlueRawIngestionJobName:
+    Description: Glue Raw Ingestion Job Name
+    Value: !Ref GlueRawIngestionJob
+    Export:
+      Name: !Sub ${EnvironmentName}-Raw-Ingestion-Job
+
+  GlueTransformationJobName:
+    Description: Glue Transformation Job Name
+    Value: !Ref GlueTransformationJob
+    Export:
+      Name: !Sub ${EnvironmentName}-Transformation-Job
+
+  GlueCSVExportJobName:
+    Description: Glue CSV Export Job Name
+    Value: !Ref GlueCSVExportJob
+    Export:
+      Name: !Sub ${EnvironmentName}-CSV-Export-Job
+
+  GlueFileArchiverJobName:
+    Description: Glue File Archiver Job Name
+    Value: !Ref GlueFileArchiverJob
+    Export:
+      Name: !Sub ${EnvironmentName}-File-Archiver-Job
